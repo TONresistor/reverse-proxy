@@ -42,6 +42,7 @@ import (
 )
 
 type Config struct {
+	ConnectPorts                 []uint16                  `json:"connect_ports,omitempty"`
 	ProxyPass                    string                    `json:"proxy_pass"`
 	PrivateKey                   []byte                    `json:"private_key"`
 	ExternalIP                   string                    `json:"external_ip"`
@@ -337,6 +338,7 @@ func main() {
 
 	// The ADNL tunnel does not forward the separate QUIC UDP socket.
 	s.EnableQUIC = *FlagQUIC && !*EnableTunnel
+	s.ConnectDialContext = rldphttp.DialConnectTo(u.Hostname(), cfg.ConnectPorts...)
 
 	addr, err := rldphttp.SerializeADNLAddress(s.Address())
 	if err != nil {

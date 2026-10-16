@@ -63,7 +63,11 @@ func (c *quicClient) SetOnQuery(handler func([]byte, *rldp.Query) error) {
 		if len(rest) != 0 {
 			return nil, errors.New("trailing bytes in QUIC HTTP query")
 		}
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		timeout := 30 * time.Second
+		if _, ok := data.(GetNextPayloadPart); ok {
+			timeout = 60 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		id := make([]byte, 32)
 		if _, err = rand.Read(id); err != nil {

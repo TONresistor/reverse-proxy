@@ -42,9 +42,10 @@ type Server struct {
 	closed bool
 	mx     sync.RWMutex
 
-	Timeout    time.Duration
-	EnableQUIC bool
-	quicServer *quic.Gateway
+	ConnectDialContext func(context.Context, string) (net.Conn, error)
+	Timeout            time.Duration
+	EnableQUIC         bool
+	quicServer         *quic.Gateway
 }
 
 type writerBuff struct {
@@ -727,6 +728,9 @@ func (s *Server) handleQuery(
 ) error {
 	switch req := query.Data.(type) {
 	case Request:
+		if req.Method == http.MethodConnect {
+			return s.handleConnect(lease, client, transferId, query, req)
+		}
 		uri, err := url.Parse(req.URL)
 		if err != nil {
 			Logger("bad HTTP request over RLDP: failed to parse url", req.URL, err)
