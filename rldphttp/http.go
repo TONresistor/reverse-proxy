@@ -54,3 +54,4 @@ type Capabilities struct {
 }
 
 const CapabilityRLDP2 int64 = 1
+const CapabilityQUIC int64 = 2

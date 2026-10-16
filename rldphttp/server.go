@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"github.com/xssnick/tonutils-go/adnl"
 	adnladdress "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"io"
 	"log"
@@ -41,7 +42,9 @@ type Server struct {
 	closed bool
 	mx     sync.RWMutex
 
-	Timeout time.Duration
+	Timeout    time.Duration
+	EnableQUIC bool
+	quicServer *quic.Gateway
 }
 
 type writerBuff struct {
@@ -423,11 +426,19 @@ func newServer(
 		dispatcher:     newRequestDispatcher(maxConcurrentRequests),
 		closer:         make(chan bool, 1),
 		Timeout:        30 * time.Second,
+		EnableQUIC:     true,
 		adnlServer:     gate,
 	}
 }
 
 func (s *Server) ListenAndServe(listenAddr string) error {
+	if s.EnableQUIC {
+		if err := s.startQUIC(listenAddr); err != nil {
+			_ = s.Stop()
+			return err
+		}
+	}
+	defer s.Stop()
 	go func() {
 		for {
 			select {
@@ -480,7 +491,7 @@ func (s *Server) ListenAndServe(listenAddr string) error {
 			switch query.Data.(type) {
 			case GetCapabilities:
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				err := client.Answer(ctx, query.ID, &Capabilities{Value: CapabilityRLDP2})
+				err := client.Answer(ctx, query.ID, &Capabilities{Value: s.capabilities()})
 				cancel()
 				if err != nil {
 					return fmt.Errorf("failed to send capabilities answer: %w", err)
@@ -557,6 +568,10 @@ func (s *Server) Stop() (err error) {
 		}
 		if s.dht != nil {
 			s.dht.Close()
+		}
+
+		if s.quicServer != nil {
+			_ = s.quicServer.Close()
 		}
 
 		if s.adnlServer != nil {

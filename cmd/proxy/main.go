@@ -53,6 +53,8 @@ type Config struct {
 	Version                      int                       `json:"version"`
 }
 
+var FlagQUIC = flag.Bool("quic", true, "accept TON QUIC on ADNL UDP port + 1000 (direct mode only)")
+
 var FlagDomain = flag.String("domain", "", "domain to configure")
 var FlagDebug = flag.Bool("debug", false, "more logs")
 var FlagAllowInsecureHttps = flag.Bool("allow-insecure-https", false, "allow insecure https")
@@ -332,6 +334,9 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to configure RLDP HTTP server")
 	}
+
+	// The ADNL tunnel does not forward the separate QUIC UDP socket.
+	s.EnableQUIC = *FlagQUIC && !*EnableTunnel
 
 	addr, err := rldphttp.SerializeADNLAddress(s.Address())
 	if err != nil {
