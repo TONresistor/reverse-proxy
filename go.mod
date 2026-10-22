@@ -25,6 +25,7 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/syndtr/goleveldb v1.0.0 // indirect
+	github.com/xssnick/quic-go-ton v0.0.0-20261001181112-f2ad8f940a32 // indirect
 	github.com/xssnick/raptorq v1.5.1 // indirect
 	github.com/xssnick/ton-payment-network v1.3.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
