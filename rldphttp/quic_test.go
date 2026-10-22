@@ -5,15 +5,20 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/xssnick/tonutils-go/adnl"
+	adnladdress "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"github.com/xssnick/tonutils-go/tl"
@@ -247,6 +252,213 @@ func TestQUICMalformedInput(t *testing.T) {
 	}
 }
 
+// Keep the server's periodic DHT refresh local to this loopback test.
+type quicTestDHT struct{}
+
+func (quicTestDHT) StoreAddress(context.Context, adnladdress.List, time.Duration, ed25519.PrivateKey) (int, []byte, error) {
+	return 1, nil, nil
+}
+func (quicTestDHT) FindAddresses(context.Context, []byte) (*adnladdress.List, ed25519.PublicKey, error) {
+	return nil, nil, nil
+}
+func (quicTestDHT) Close() {}
+
+func TestServerQUIC(t *testing.T) {
+	for _, mode := range []string{"quic", "port busy", "tunnel"} {
+		t.Run(mode, func(t *testing.T) {
+			_, key, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Reserve both derived ports before starting; keep QUIC occupied only
+			// in the failure case to verify that RLDP startup remains independent.
+			var rldpConn, quicReservation net.PacketConn
+			var quicAddr string
+			for attempt := 0; attempt < 10; attempt++ {
+				rldpConn, err = net.ListenPacket("udp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rldpConn.LocalAddr().(*net.UDPAddr).Port > 64535 {
+					_ = rldpConn.Close()
+					continue
+				}
+				endpoint, endpointErr := quic.PeerEndpoint([]adnladdress.Address{adnladdress.UDP{IP: net.IPv4(127, 0, 0, 1), Port: int32(rldpConn.LocalAddr().(*net.UDPAddr).Port)}})
+				if endpointErr != nil {
+					t.Fatal(endpointErr)
+				}
+				if endpoint.Port() != 0 {
+					quicAddr = endpoint.String()
+					quicReservation, err = net.ListenPacket("udp", quicAddr)
+					if err == nil {
+						break
+					}
+				}
+				_ = rldpConn.Close()
+			}
+			if quicReservation == nil {
+				t.Fatal("failed to reserve loopback port pair")
+			}
+			defer quicReservation.Close()
+			defer rldpConn.Close()
+			addr := rldpConn.LocalAddr().String()
+			manager := adnl.NewMultiNetReader(rldpConn)
+			defer manager.Close()
+			gate := adnl.NewGatewayWithNetManager(key, manager)
+			srv := NewServer(key, gate, quicTestDHT{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read request body: %v", err)
+					w.WriteHeader(500)
+					return
+				}
+				if r.URL.Path != "/test" {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				_, _ = fmt.Fprintf(w, "%s:%s", r.Method, body)
+			}))
+			if mode != "port busy" {
+				_ = quicReservation.Close()
+			}
+			serve := srv.ListenAndServe
+			if mode == "tunnel" {
+				serve = srv.ListenAndServeTunnel
+			}
+			done := make(chan error, 1)
+			go func() { done <- serve(addr) }()
+			t.Cleanup(func() {
+				if err := srv.Stop(); err != nil {
+					t.Errorf("stop server: %v", err)
+				}
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("serve HTTP: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("server did not stop")
+				}
+			})
+
+			_, clientKey, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clientGateway := adnl.NewGateway(clientKey)
+			if err := clientGateway.StartClient(); err != nil {
+				t.Fatal(err)
+			}
+			defer clientGateway.Close()
+			peer, err := clientGateway.RegisterClient(addr, key.Public().(ed25519.PublicKey))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			wantCapabilities := CapabilityRLDP2
+			if mode == "quic" {
+				wantCapabilities |= CapabilityQUIC
+			}
+			for {
+				var capabilities Capabilities
+				if err := peer.Query(ctx, GetCapabilities{}, &capabilities); err != nil {
+					t.Fatal(err)
+				}
+				if capabilities.Value == wantCapabilities {
+					break
+				}
+				if capabilities.Value != CapabilityRLDP2 {
+					t.Fatalf("unexpected capabilities: %d", capabilities.Value)
+				}
+				select {
+				case <-time.After(10 * time.Millisecond):
+				case <-ctx.Done():
+					t.Fatal("QUIC did not become ready")
+				}
+			}
+			var transport RLDP
+			if mode == "quic" {
+				client, _ := startQUICGateway(t)
+				quicPeer, err := client.DialDefault(ctx, key.Public().(ed25519.PublicKey), quicAddr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				transport = newQUICClient(quicPeer, 30*time.Second)
+			} else {
+				transport = rldp.NewClientV2(peer)
+			}
+			defer transport.Close()
+			for index, method := range []string{http.MethodGet, http.MethodPost} {
+				id := bytes.Repeat([]byte{byte(index + 1)}, 32)
+				requestBody := ""
+				if method == http.MethodPost {
+					requestBody = "POST body pulled on the same peer"
+				}
+				stream := &payloadStream{Data: io.NopCloser(bytes.NewBufferString(requestBody))}
+				var pulls atomic.Int32
+				transport.SetOnQuery(func(transferID []byte, query *rldp.Query) error {
+					req, ok := query.Data.(GetNextPayloadPart)
+					if !ok || !bytes.Equal(req.ID, id) {
+						return fmt.Errorf("unexpected body query: %T", query.Data)
+					}
+					pulls.Add(1)
+					part, err := handleGetPart(req, stream)
+					if err != nil {
+						return err
+					}
+					return transport.SendAnswer(ctx, query.MaxAnswerSize, query.Timeout, query.ID, transferID, part)
+				})
+				request := Request{ID: id, Method: method, URL: "http://test.ton/test", Version: "HTTP/1.1"}
+				if requestBody != "" {
+					request.Headers = []Header{{Name: "Content-Length", Value: fmt.Sprint(len(requestBody))}}
+				}
+				var response Response
+				if err := transport.DoQuery(ctx, _RLDPMaxAnswerSize, request, &response); err != nil {
+					t.Fatal(err)
+				}
+				if response.StatusCode != 200 || response.NoPayload {
+					t.Fatalf("unexpected %s response: %+v", method, response)
+				}
+				var body bytes.Buffer
+				if err := srv.fetchPayload(ctx, id, transport, &body); err != nil {
+					t.Fatal(err)
+				}
+				if want := method + ":" + requestBody; body.String() != want {
+					t.Fatalf("body = %q, want %q", body.String(), want)
+				}
+				if method == http.MethodPost && pulls.Load() == 0 {
+					t.Fatal("request body was not pulled")
+				}
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("server stopped prematurely: %v", err)
+			default:
+			}
+			if mode == "tunnel" {
+				unbound, err := net.ListenPacket("udp", quicAddr)
+				if err != nil {
+					t.Fatalf("tunnel mode bound the QUIC port: %v", err)
+				}
+				_ = unbound.Close()
+			}
+			if err := srv.Stop(); err != nil {
+				t.Fatal(err)
+			}
+			if srv.capabilities() != CapabilityRLDP2 {
+				t.Fatal("QUIC still advertised after Stop")
+			}
+			if mode == "quic" {
+				rebound, err := net.ListenPacket("udp", quicAddr)
+				if err != nil {
+					t.Fatalf("QUIC socket was not released: %v", err)
+				}
+				_ = rebound.Close()
+			}
+		})
+	}
+}
+
 // Adapter failure tests also verify that the single available stream slot is reusable.
 func quicFailureFixture(t *testing.T, timeout time.Duration, configure func(*quicClient, *quic.Peer)) (*quic.Peer, *quicClient) {
 	t.Helper()
@@ -368,5 +580,109 @@ func TestQUICAnswerLimit(t *testing.T) {
 	}
 	if response.StatusCode != 204 {
 		t.Fatalf("unexpected answer: %+v", response)
+	}
+}
+
+// Server wiring failure tests exercise errors recovered by the asynchronous runQuery path.
+type quicErrorReader struct{}
+
+func (quicErrorReader) Read([]byte) (int, error) { return 0, fmt.Errorf("test payload reader error") }
+func (quicErrorReader) Close() error             { return nil }
+
+func TestQUICRunQueryFailureReleasesStream(t *testing.T) {
+	for _, failure := range []string{"error", "panic"} {
+		t.Run(failure, func(t *testing.T) {
+			srv := NewServer(nil, nil, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/panic" {
+					panic("test HTTP handler panic")
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(func() { _ = srv.Stop() })
+			id := make([]byte, 32)
+			if err := srv.registerPayloadStream(hex.EncodeToString(id), &payloadStream{Data: quicErrorReader{}}, nil); err != nil {
+				t.Fatal(err)
+			}
+			peer, c := quicFailureFixture(t, srv.Timeout, func(c *quicClient, peer *quic.Peer) { c.SetOnQuery(srv.handle(c, "test", peer.RemoteAddr())) })
+			var query tl.Serializable = GetNextPayloadPart{ID: id, MaxChunkSize: 1}
+			if failure == "panic" {
+				query = Request{ID: id, Method: "GET", URL: "/panic", Version: "HTTP/1.1"}
+			}
+			checkQUICFailure(t, peer, c, query)
+		})
+	}
+}
+
+func TestStopDuringQUICStartup(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(key, nil, nil, http.NotFoundHandler())
+	t.Cleanup(func() { _ = srv.Stop() })
+	bound := make(chan net.Addr, 1)
+	resume := make(chan struct{})
+	var resumeOnce sync.Once
+	release := func() { resumeOnce.Do(func() { close(resume) }) }
+	defer release()
+	startup := make(chan error, 1)
+	go func() {
+		startup <- srv.startQUICWithListener("127.0.0.1:0", func(network, addr string) (net.PacketConn, error) {
+			conn, err := net.ListenPacket(network, "127.0.0.1:0")
+			if err != nil {
+				return nil, err
+			}
+			bound <- conn.LocalAddr()
+			<-resume
+			return conn, nil
+		})
+	}()
+	var addr net.Addr
+	select {
+	case addr = <-bound:
+	case err := <-startup:
+		t.Fatalf("startup failed before bind: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup did not bind")
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- srv.Stop() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked on QUIC startup")
+	}
+	release()
+	select {
+	case err := <-startup:
+		if !errors.Is(err, ErrServerStopped) {
+			t.Fatalf("startup error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup did not finish after Stop")
+	}
+	srv.mx.RLock()
+	published := srv.quicServer != nil || srv.quicConn != nil
+	srv.mx.RUnlock()
+	if published {
+		t.Fatal("QUIC was published after Stop")
+	}
+	conn, err := net.ListenPacket("udp", addr.String())
+	if err != nil {
+		t.Fatalf("startup leaked its socket: %v", err)
+	}
+	_ = conn.Close()
+}
+
+func TestQUICRejectsWrappingPort(t *testing.T) {
+	srv := NewServer(nil, nil, nil, http.NotFoundHandler())
+	if err := srv.startQUICWithListener("127.0.0.1:64536", func(string, string) (net.PacketConn, error) {
+		t.Error("invalid port reached the listener")
+		return nil, fmt.Errorf("unexpected bind")
+	}); err == nil {
+		t.Fatal("wrapping QUIC port was accepted")
 	}
 }

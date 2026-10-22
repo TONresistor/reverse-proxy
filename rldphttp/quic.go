@@ -5,7 +5,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"net"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
@@ -241,4 +243,99 @@ func (c *quicClient) failQuery(id []byte, err error) {
 		pending <- quicResult{err: err}
 		delete(c.pending, string(id))
 	}
+}
+
+func (s *Server) capabilities() int64 {
+	s.mx.RLock()
+	defer s.mx.RUnlock()
+	capabilities := CapabilityRLDP2
+	if s.quicServer != nil {
+		capabilities |= CapabilityQUIC
+	}
+	return capabilities
+}
+
+func (s *Server) startQUIC(listenAddr string) error {
+	return s.startQUICWithListener(listenAddr, net.ListenPacket)
+}
+
+func (s *Server) startQUICWithListener(listenAddr string, listen func(string, string) (net.PacketConn, error)) error {
+	s.mx.RLock()
+	closed := s.closed
+	s.mx.RUnlock()
+	if closed {
+		return ErrServerStopped
+	}
+	host, portString, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to parse QUIC listen address: %w", err)
+	}
+	port, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil {
+		return fmt.Errorf("failed to parse QUIC listen port: %w", err)
+	}
+	if port > 64535 {
+		return fmt.Errorf("QUIC base port %d exceeds maximum 64535", port)
+	}
+	addr := net.JoinHostPort(host, strconv.FormatUint(port+1000, 10))
+	gateway, err := newQUICGateway(s.key)
+	if err != nil {
+		return fmt.Errorf("failed to create QUIC gateway: %w", err)
+	}
+	conn, err := listen("udp", addr)
+	if err != nil {
+		_ = gateway.Close()
+		return fmt.Errorf("failed to bind QUIC socket: %w", err)
+	}
+	gateway.SetConnectionHandler(func(peer *quic.Peer) error {
+		adnlAddr, err := SerializeADNLAddress(peer.PeerID())
+		if err != nil {
+			return err
+		}
+		client := newQUICClient(peer, s.Timeout)
+		client.SetOnQuery(s.handle(client, adnlAddr, peer.RemoteAddr()))
+		return nil
+	})
+	serveDone := make(chan error, 1)
+	go func() {
+		err := gateway.Serve(conn)
+		_ = conn.Close()
+		serveDone <- err
+		s.mx.Lock()
+		if s.quicServer == gateway {
+			s.quicServer = nil
+			s.quicConn = nil
+		}
+		closed := s.closed
+		s.mx.Unlock()
+		if !closed && err != nil {
+			Logger("WARNING: QUIC stopped, continuing with RLDP:", err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := gateway.WaitReady(ctx); err != nil {
+		_ = gateway.Close()
+		_ = conn.Close()
+		return fmt.Errorf("failed to serve QUIC: %w", err)
+	}
+	s.mx.Lock()
+	if s.closed {
+		s.mx.Unlock()
+		_ = gateway.Close()
+		_ = conn.Close()
+		return ErrServerStopped
+	}
+	select {
+	case err := <-serveDone:
+		s.mx.Unlock()
+		_ = gateway.Close()
+		return fmt.Errorf("QUIC stopped during startup: %v", err)
+	default:
+	}
+	s.quicServer = gateway
+	s.quicConn = conn
+	s.mx.Unlock()
+	Logger("QUIC HTTP listening on", conn.LocalAddr())
+	return nil
 }

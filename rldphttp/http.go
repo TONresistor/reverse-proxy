@@ -53,4 +53,7 @@ type Capabilities struct {
 	Value int64 `tl:"long"`
 }
 
-const CapabilityRLDP2 int64 = 1
+const (
+	CapabilityRLDP2 int64 = 1
+	CapabilityQUIC  int64 = 2
+)

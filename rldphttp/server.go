@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"github.com/xssnick/tonutils-go/adnl"
 	adnladdress "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"io"
 	"log"
@@ -34,6 +35,8 @@ type Server struct {
 	rldpInfos      map[string]*rldpInfo
 	activeRequests *activeRequestRegistry
 	adnlServer     *adnl.Gateway
+	quicServer     *quic.Gateway
+	quicConn       net.PacketConn
 	externalIp     net.IP
 	dispatcher     *requestDispatcher
 
@@ -428,6 +431,16 @@ func newServer(
 }
 
 func (s *Server) ListenAndServe(listenAddr string) error {
+	return s.listenAndServe(listenAddr, true)
+}
+
+// ListenAndServeTunnel serves RLDP through the supplied tunnel gateway.
+// A tunnel does not expose the corresponding local QUIC UDP endpoint.
+func (s *Server) ListenAndServeTunnel(listenAddr string) error {
+	return s.listenAndServe(listenAddr, false)
+}
+
+func (s *Server) listenAndServe(listenAddr string, enableQUIC bool) error {
 	go func() {
 		for {
 			select {
@@ -480,7 +493,7 @@ func (s *Server) ListenAndServe(listenAddr string) error {
 			switch query.Data.(type) {
 			case GetCapabilities:
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				err := client.Answer(ctx, query.ID, &Capabilities{Value: CapabilityRLDP2})
+				err := client.Answer(ctx, query.ID, &Capabilities{Value: s.capabilities()})
 				cancel()
 				if err != nil {
 					return fmt.Errorf("failed to send capabilities answer: %w", err)
@@ -502,6 +515,12 @@ func (s *Server) ListenAndServe(listenAddr string) error {
 	if err != nil {
 		_ = s.Stop()
 		return err
+	}
+
+	if enableQUIC {
+		if err := s.startQUIC(listenAddr); err != nil {
+			Logger("WARNING: failed to start QUIC, continuing with RLDP:", err)
+		}
 	}
 
 	<-s.closer
@@ -557,6 +576,15 @@ func (s *Server) Stop() (err error) {
 		}
 		if s.dht != nil {
 			s.dht.Close()
+		}
+
+		if s.quicServer != nil {
+			if closeErr := s.quicServer.Close(); closeErr != nil {
+				Logger("failed to close QUIC gateway:", closeErr)
+			}
+			_ = s.quicConn.Close()
+			s.quicServer = nil
+			s.quicConn = nil
 		}
 
 		if s.adnlServer != nil {
@@ -690,14 +718,22 @@ func (s *Server) runQuery(
 	if continuation != nil {
 		defer continuation.finishContinuation()
 	}
+	var queryErr error
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			queryErr = fmt.Errorf("panic while handling HTTP query: %v", recovered)
 			Logger("panic while handling RLDP HTTP query: ", recovered, "\n", string(debug.Stack()))
+		}
+		if queryErr != nil && query != nil {
+			if pending, ok := client.(interface{ failQuery([]byte, error) }); ok {
+				pending.failQuery(query.ID, queryErr)
+			}
 		}
 	}()
 
-	if err := s.handleQuery(lease, continuation, client, adnlId, netAddr, transferId, query); err != nil {
-		Logger("failed to handle RLDP HTTP query: ", err)
+	queryErr = s.handleQuery(lease, continuation, client, adnlId, netAddr, transferId, query)
+	if queryErr != nil {
+		Logger("failed to handle RLDP HTTP query: ", queryErr)
 	}
 }
 

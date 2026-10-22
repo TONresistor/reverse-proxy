@@ -347,7 +347,11 @@ func main() {
 		log.Info().Str("address", addr+".adnl").
 			Int("max_concurrent_requests", *FlagMaxConcurrentRequests).
 			Msg("Starting server")
-		if err = s.ListenAndServe(fmt.Sprintf("%s:%d", cfg.ListenIP, cfg.Port)); err != nil {
+		serve := s.ListenAndServe
+		if *EnableTunnel {
+			serve = s.ListenAndServeTunnel
+		}
+		if err = serve(fmt.Sprintf("%s:%d", cfg.ListenIP, cfg.Port)); err != nil {
 			log.Fatal().Err(err).Msg("Failed to listen and serve")
 		}
 	}()

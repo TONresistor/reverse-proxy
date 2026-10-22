@@ -49,6 +49,8 @@ The proxy processes up to 20,000 RLDP HTTP requests concurrently across all peer
 ./tonutils-reverse-proxy-linux-amd64 --max-concurrent-requests 30000
 ```
 
+QUIC uses UDP port+1000, which must be open (and port-forwarded when behind NAT).
+
 ##### Use
 
 Now anyone can access your TON Site! Using ADNL address or domain. 
