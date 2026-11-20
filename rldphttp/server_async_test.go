@@ -2,8 +2,11 @@ package rldphttp
 
 import (
 	"bytes"
-	"encoding/hex"
+	"fmt"
+	"testing/iotest"
+
 	"errors"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -265,8 +268,8 @@ func TestHandleRejectsUnknownAndConcurrentPayloadContinuations(t *testing.T) {
 	if err := invokeAsyncCallback(t, callback, []byte("part-transfer"), asyncGetPartQuery(requestID)); err != nil {
 		t.Fatalf("admit first payload continuation: %v", err)
 	}
-	stream := srv.activeRequests.get(hex.EncodeToString(requestID))
-	if stream == nil || !stream.continuing.Load() {
+	stream := srv.activeRequests.get(payloadKey("peer", requestID))
+	if stream == nil || stream.pending.Load() == nil {
 		t.Fatal("first payload continuation was not marked in flight")
 	}
 
@@ -282,6 +285,102 @@ func TestHandleRejectsUnknownAndConcurrentPayloadContinuations(t *testing.T) {
 	waitForAsyncCondition(t, "payload continuation completion", func() bool {
 		return client.answerCount() == 2 && dispatcherActive(srv.dispatcher) == 0
 	})
+}
+
+func TestPayloadContinuationReleasePreservesNewerClaim(t *testing.T) {
+	registry := newActiveRequestRegistry()
+	stream := &payloadStream{}
+	registry.store("request", stream)
+	first, exists := registry.claimContinuation("request", time.Now(), GetNextPayloadPart{})
+	if !exists || first == nil {
+		t.Fatal("first continuation was not admitted")
+	}
+	if concurrent, exists := registry.claimContinuation("request", time.Now(), GetNextPayloadPart{}); !exists || concurrent != nil {
+		t.Fatal("concurrent continuation was admitted")
+	}
+	first.release()
+	second, exists := registry.claimContinuation("request", time.Now(), GetNextPayloadPart{})
+	if !exists || second == nil {
+		t.Fatal("next continuation was not admitted after release")
+	}
+	// The old worker still runs its deferred cleanup after the next admission.
+	first.release()
+	if stream.pending.Load() == nil {
+		t.Fatal("old continuation release cleared the newer claim")
+	}
+	if concurrent, exists := registry.claimContinuation("request", time.Now(), GetNextPayloadPart{}); !exists || concurrent != nil {
+		t.Fatal("old continuation release allowed a concurrent reader")
+	}
+	second.release()
+	if stream.pending.Load() != nil {
+		t.Fatal("new continuation did not release its own claim")
+	}
+}
+
+type continuationFailureReader struct{ panicOnRead bool }
+
+func (r continuationFailureReader) Read([]byte) (int, error) {
+	if r.panicOnRead {
+		panic("test continuation read panic")
+	}
+	return 0, errors.New("test continuation read error")
+}
+
+func (continuationFailureReader) Close() error { return nil }
+
+type continuationFailureObserver struct {
+	RLDP
+	onFailure func(error)
+}
+
+func (c *continuationFailureObserver) failQuery(_ []byte, err error) { c.onFailure(err) }
+
+func TestRunQueryReleasesContinuationBeforeFailurePublication(t *testing.T) {
+	for _, failure := range []string{"invalid part", "read error", "read panic", "send error"} {
+		t.Run(failure, func(t *testing.T) {
+			srv := newAsyncTestServer(t, 1, nil)
+			requestID := bytes.Repeat([]byte{0x54}, 32)
+			requestKey := payloadKey("test", requestID)
+			stream := &payloadStream{Data: io.NopCloser(bytes.NewReader([]byte("abc")))}
+			query := asyncGetPartQuery(requestID)
+			client := &mockRLDP{}
+			switch failure {
+			case "invalid part":
+				part := query.Data.(GetNextPayloadPart)
+				part.Seqno = -1
+				query.Data = part
+			case "read error":
+				stream.Data = continuationFailureReader{}
+			case "read panic":
+				stream.Data = continuationFailureReader{panicOnRead: true}
+			case "send error":
+				client.sendErr = errors.New("test continuation send error")
+			}
+			srv.activeRequests.store(requestKey, stream)
+			defer srv.Stop()
+			continuation, exists := srv.activeRequests.claimContinuation(requestKey, time.Now().Add(srv.Timeout), query.Data.(GetNextPayloadPart))
+			if !exists || continuation == nil {
+				t.Fatal("continuation was not admitted")
+			}
+			var published bool
+			observer := &continuationFailureObserver{RLDP: client, onFailure: func(err error) {
+				published = true
+				if err == nil {
+					t.Error("published a nil failure")
+				}
+				if stream.pending.Load() != nil {
+					t.Error("failure published while the continuation was still claimed")
+				}
+			}}
+			srv.runQuery(nil, continuation, observer, "test", testRemoteAddr(), nil, query)
+			if !published {
+				t.Fatal("failed continuation did not publish its failure")
+			}
+			if stream.pending.Load() != nil {
+				t.Fatal("failed continuation did not release its claim")
+			}
+		})
+	}
 }
 
 func TestHandleReleasesRequestSlotAfterPanic(t *testing.T) {
@@ -579,7 +678,7 @@ func TestHandleSnapshotsQueryBeforeReturning(t *testing.T) {
 	if !bytes.Equal(gotTransferID, wantTransferID) {
 		t.Fatalf("answer transfer ID changed after callback return: %x", gotTransferID)
 	}
-	if srv.activeRequests.get(hex.EncodeToString(wantRequestID)) == nil {
+	if srv.activeRequests.get(payloadKey("peer", wantRequestID)) == nil {
 		t.Fatal("response stream was registered with mutated request ID")
 	}
 
@@ -647,5 +746,105 @@ func TestActiveRequestRegistryConditionalDeletePreservesReplacement(t *testing.T
 	}
 	if !registry.deleteIfSame(key, second) {
 		t.Fatal("current stream was not deleted")
+	}
+}
+
+func TestReplayLastResponsePartAfterSendFailure(t *testing.T) {
+	srv := newAsyncTestServer(t, 1, nil)
+	defer srv.Stop()
+	id := bytes.Repeat([]byte{1}, 32)
+	key := payloadKey("peer", id)
+	until := time.Now().Add(srv.Timeout)
+	stream := &payloadStream{Data: io.NopCloser(iotest.DataErrReader(bytes.NewReader([]byte("abcdefg")))), resumable: true}
+	if err := srv.registerPayloadStream(key, stream, nil); err != nil {
+		t.Fatal(err)
+	}
+	query := func(seq int32) *rldp.Query {
+		q := asyncGetPartQueryAt(id, seq)
+		q.Data = GetNextPayloadPart{ID: id, Seqno: seq, MaxChunkSize: 3}
+		return q
+	}
+	claim := func(q *rldp.Query) *payloadContinuation {
+		c, ok := srv.activeRequests.claimContinuation(key, until, q.Data.(GetNextPayloadPart))
+		if !ok || c == nil {
+			t.Fatal("continuation not accepted")
+		}
+		return c
+	}
+	send := func(c *payloadContinuation, q *rldp.Query, err error) *PayloadPart {
+		peer := &mockRLDP{sendErr: err}
+		srv.runQuery(nil, c, peer, "peer", testRemoteAddr(), nil, q)
+		if len(peer.answers) != 1 {
+			return nil
+		}
+		return peer.answers[0].(*PayloadPart)
+	}
+	q := query(0)
+	initial := claim(q)
+	waiting := claim(q)
+	if waiting.replay == nil || waiting.replay != initial.producing {
+		t.Fatal("overlapping reads did not share the pending part")
+	}
+	if got := send(initial, q, nil); got == nil || string(got.Data) != "abc" {
+		t.Fatal(got)
+	}
+	if got := send(waiting, q, nil); got == nil || string(got.Data) != "abc" {
+		t.Fatal(got)
+	}
+	q = query(1)
+	if got := send(claim(q), q, nil); got == nil || string(got.Data) != "def" {
+		t.Fatal(got)
+	}
+	q = query(2)
+	last := send(claim(q), q, errors.New("lost final answer"))
+	if last == nil || !last.IsLast || string(last.Data) != "g" || srv.activeRequests.len() != 0 {
+		t.Fatal("final part did not release live stream", last)
+	}
+	req := q.Data.(GetNextPayloadPart)
+	for _, other := range []struct {
+		key       string
+		seq, size int32
+	}{{payloadKey("other peer", id), 2, 3}, {key, 1, 3}, {key, 2, 4}} {
+		mismatch := req
+		mismatch.Seqno = other.seq
+		mismatch.MaxChunkSize = other.size
+		if _, ok := srv.activeRequests.claimContinuation(other.key, until, mismatch); ok {
+			t.Fatal("replay matched wrong peer, sequence or size")
+		}
+	}
+	if got := send(claim(q), q, nil); got == nil || !got.IsLast || !bytes.Equal(got.Data, last.Data) {
+		t.Fatal("final part unavailable", got)
+	}
+	srv.activeRequests.expired(until.Add(time.Second))
+	if _, ok := srv.activeRequests.claimContinuation(key, until, req); ok {
+		t.Fatal("expired replay still available")
+	}
+}
+
+func TestResponseReplayCacheEvictsWithinBudget(t *testing.T) {
+	r := newActiveRequestRegistry()
+	sh := r.shard("test")
+	var keys []string
+	for n := 0; len(keys) < 17; n++ {
+		key := fmt.Sprint(n)
+		if r.shard(key) == sh {
+			keys = append(keys, key)
+		}
+	}
+	save := func(key string, size int) {
+		stream := &payloadStream{}
+		r.store(key, stream)
+		r.rememberPart(key, GetNextPayloadPart{MaxChunkSize: int32(size)}, stream, &PayloadPart{Data: make([]byte, size), IsLast: true}, time.Minute)
+		r.deleteIfSame(key, stream)
+	}
+	for _, k := range keys {
+		save(k, 1)
+	}
+	if len(sh.recent) != 16 || sh.recent[0].key != keys[1] {
+		t.Fatalf("unexpected cached entries %d", len(sh.recent))
+	}
+	save(keys[0], 1<<20)
+	if len(sh.recent) != 1 || sh.recent[0].key != keys[0] {
+		t.Fatal("full-size part exceeded the shard payload budget")
 	}
 }

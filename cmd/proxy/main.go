@@ -17,6 +17,7 @@ import (
 	tunnelConfig "github.com/ton-blockchain/adnl-tunnel/config"
 	"github.com/ton-blockchain/adnl-tunnel/tunnel"
 	"github.com/ton-utils/reverse-proxy/config"
+	"github.com/ton-utils/reverse-proxy/internal/quicwire"
 	"github.com/ton-utils/reverse-proxy/rldphttp"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
@@ -31,6 +32,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -42,6 +44,7 @@ import (
 )
 
 type Config struct {
+	ConnectPorts                 []uint16                  `json:"connect_ports,omitempty"`
 	ProxyPass                    string                    `json:"proxy_pass"`
 	PrivateKey                   []byte                    `json:"private_key"`
 	ExternalIP                   string                    `json:"external_ip"`
@@ -52,6 +55,8 @@ type Config struct {
 	TunnelConfig                 tunnelConfig.ClientConfig `json:"tunnel_config"`
 	Version                      int                       `json:"version"`
 }
+
+var FlagQUIC = flag.Bool("quic", true, "accept TON QUIC (direct UDP or through the configured tunnel)")
 
 var FlagDomain = flag.String("domain", "", "domain to configure")
 var FlagDebug = flag.Bool("debug", false, "more logs")
@@ -178,6 +183,7 @@ func main() {
 	ip := net.ParseIP(cfg.ExternalIP)
 
 	var netMgr adnl.NetManager
+	var quicConn net.PacketConn
 	var gate *adnl.Gateway
 	if *EnableTunnel {
 		tunNetCfg := netCfg
@@ -215,8 +221,8 @@ func main() {
 		events := make(chan any, 1)
 		go tunnel.RunTunnel(closerCtx, &cfg.TunnelConfig, &tunSharedCfg, tunNetCfg, log.Logger, events)
 
-		initUpd := make(chan tunnel.UpdatedEvent, 1)
-		once := sync.Once{}
+		atm := &tunnel.AtomicSwitchableRegularTunnel{}
+		exits := tunnelExitUpdates{tunnel: atm, changed: make(chan struct{}, 1)}
 		go func() {
 			for event := range events {
 				switch e := event.(type) {
@@ -226,20 +232,10 @@ func main() {
 				case tunnel.UpdatedEvent:
 					log.Info().Msg("Tunnel updated")
 
-					e.Tunnel.SetOutAddressChangedHandler(func(addr *net.UDPAddr) {
-						log.Info().Str("addr", addr.IP.String()).Int("port", addr.Port).Msg("Out address updated")
-
-						adnlAddr, err := address.NewAddress(addr.IP, int32(addr.Port))
-						if err != nil {
-							log.Error().Err(err).Str("addr", addr.String()).Msg("Failed to build tunnel ADNL address")
-							return
-						}
-						gate.SetAddressList([]address.Address{adnlAddr})
-					})
-
-					once.Do(func() {
-						initUpd <- e
-					})
+					tun := e.Tunnel
+					atm.SwitchTo(tun)
+					exits.update(tun, &net.UDPAddr{IP: e.ExtIP, Port: int(e.ExtPort)})
+					tun.SetOutAddressChangedHandler(func(addr *net.UDPAddr) { exits.update(tun, addr) })
 				case tunnel.ConfigurationErrorEvent:
 					log.Err(e.Err).Msg("Tunnel configuration error, will retry...")
 				case error:
@@ -248,13 +244,24 @@ func main() {
 			}
 		}()
 
-		upd := <-initUpd
-		netMgr = adnl.NewMultiNetReader(upd.Tunnel)
+		select {
+		case <-exits.changed:
+		case <-tunnelCtx.Done():
+			return
+		}
+		initial := exits.address()
+		ip, port = net.IP(initial.Addr().AsSlice()), initial.Port()
+		var ad net.PacketConn = atm
+		if *FlagQUIC {
+			ad, quicConn = quicwire.Split(atm)
+			defer quicConn.Close()
+		}
+		manager := adnl.NewMultiNetReader(ad)
+		netMgr = manager
 		gate = adnl.NewGatewayWithNetManager(ed25519.NewKeyFromSeed(cfg.PrivateKey), netMgr)
-
-		log.Info().Str("out_ip", upd.ExtIP.String()).Msg("Using tunnel")
-		ip = upd.ExtIP
-		port = upd.ExtPort
+		gate.SetAddressList(tunnelAddresses(ip, port, *FlagQUIC))
+		go exits.announce(tunnelCtx, gate, initial, *FlagQUIC)
+		log.Info().Msg("Using tunnel")
 	} else {
 		addr := cfg.ListenIP + ":" + strconv.Itoa(int(cfg.Port))
 		dl, err := adnl.DefaultListener(addr)
@@ -270,7 +277,9 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Str("ip", cfg.ExternalIP).Uint16("port", port).Msg("Failed to build ADNL address")
 	}
-	gate.SetAddressList([]address.Address{adnlAddr})
+	if !*EnableTunnel {
+		gate.SetAddressList([]address.Address{adnlAddr})
+	}
 
 	_, dhtAdnlKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
@@ -332,6 +341,12 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to configure RLDP HTTP server")
 	}
+
+	s.EnableQUIC = *FlagQUIC
+	if quicConn != nil {
+		s.UseQUICTunnel(quicConn)
+	}
+	s.ConnectDialContext = rldphttp.DialConnectTo(u.Hostname(), cfg.ConnectPorts...)
 
 	addr, err := rldphttp.SerializeADNLAddress(s.Address())
 	if err != nil {
@@ -569,4 +584,96 @@ func resolve(ctx context.Context, client *dns.Client, domain string, adnlAddr []
 	}
 
 	return bytes.Equal(record, adnlAddr), nil
+}
+
+// Address callbacks can run under the tunnel's lock. Only the publisher sends packets.
+type tunnelExitUpdates struct {
+	tunnel  *tunnel.AtomicSwitchableRegularTunnel
+	mx      sync.Mutex
+	latest  netip.AddrPort
+	changed chan struct{}
+}
+
+func (u *tunnelExitUpdates) update(source *tunnel.RegularOutTunnel, addr *net.UDPAddr) {
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	ep := addr.AddrPort()
+	ep = netip.AddrPortFrom(ep.Addr().Unmap(), ep.Port())
+	if source != u.tunnel.Current() || ep == u.latest {
+		return
+	}
+	u.latest = ep
+	select {
+	case u.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (u *tunnelExitUpdates) address() netip.AddrPort {
+	u.mx.Lock()
+	defer u.mx.Unlock()
+	return u.latest
+}
+
+func (u *tunnelExitUpdates) announce(ctx context.Context, gate *adnl.Gateway, published netip.AddrPort, enableQUIC bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-u.changed:
+		}
+		if u.address() == published {
+			continue
+		}
+		// SetAddressList versions have one-second resolution. Coalesce changes
+		// in that second so a peer never receives a different list with the same version.
+		list := gate.GetAddressList()
+		next := time.Unix(int64(list.Version)+1, 0)
+		if delay := time.Until(next); delay > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+		}
+		exit := u.address()
+		if exit == published {
+			continue
+		}
+		list.Addresses = tunnelAddresses(net.IP(exit.Addr().AsSlice()), exit.Port(), enableQUIC)
+		peers := gate.GetActivePeers()
+		active := peers[:0]
+		for _, peer := range peers {
+			stats := peer.Stats()
+			if !stats.Closed && stats.Inbound.Packets > 0 {
+				// A concurrent RLDP send can build the first root packet during
+				// Reinit. Stage B at the existing epoch so that packet cannot
+				// advertise A with the new version.
+				list.ReinitDate = stats.Reinitialization.LocalEpoch
+				peer.SetAddresses(list)
+				peer.Reinit()
+				active = append(active, peer)
+			}
+		}
+		// A channel NOP carries no address list. After Reinit the next NOP is
+		// a signed root packet; install B's addresses and epoch before sending it.
+		gate.SetAddressList(list.Addresses)
+		published = exit
+		for _, peer := range active {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := peer.SendNop(ctx); err != nil {
+				log.Warn().Err(err).Msg("Failed to announce tunnel exit to peer")
+			}
+		}
+	}
+}
+
+func tunnelAddresses(ip net.IP, port uint16, enableQUIC bool) []address.Address {
+	result := []address.Address{&address.UDP{IP: ip, Port: int32(port)}}
+	if enableQUIC {
+		result = append(result, &address.QUIC{IP: ip, Port: int32(port)})
+	}
+	return result
 }

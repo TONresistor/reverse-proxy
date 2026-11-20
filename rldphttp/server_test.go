@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/hex"
+
 	"errors"
 	"io"
 	"net"
@@ -170,7 +170,7 @@ func responseHeader(resp Response, name string) string {
 func activeStream(t *testing.T, srv *Server, requestID []byte) *payloadStream {
 	t.Helper()
 
-	stream := srv.activeRequests.get(hex.EncodeToString(requestID))
+	stream := srv.activeRequests.get(payloadKey("", requestID))
 	if stream == nil {
 		t.Fatal("expected active request stream")
 	}
@@ -740,7 +740,7 @@ func TestHandleGetPartRefreshesActiveRequestTTL(t *testing.T) {
 	}
 
 	requestID := []byte("request-id-request-id-request-1")
-	requestKey := hex.EncodeToString(requestID)
+	requestKey := payloadKey("adnl-id", requestID)
 	oldTTL := time.Now().Add(-time.Second)
 	srv := &Server{
 		activeRequests: newActiveRequestRegistry(),
@@ -785,7 +785,7 @@ func TestHandleGetPartSendAnswerErrorCleansActiveRequest(t *testing.T) {
 	}
 
 	requestID := []byte("request-id-request-id-request-1")
-	requestKey := hex.EncodeToString(requestID)
+	requestKey := payloadKey("adnl-id", requestID)
 	srv := &Server{
 		activeRequests: newActiveRequestRegistry(),
 		Timeout:        time.Minute,

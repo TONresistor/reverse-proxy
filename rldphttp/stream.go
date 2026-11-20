@@ -9,31 +9,53 @@ import (
 
 type payloadStream struct {
 	nextSeqno int32
-	Data      io.ReadCloser
-	ValidTill time.Time
-	lease     *requestLease
+	resumable bool
+	pending   atomic.Pointer[payloadContinuation]
+
+	Data          io.ReadCloser
+	ValidTill     time.Time
+	lease         *requestLease
+	onResponseEOF func()
 
 	mx         sync.Mutex
 	readMx     sync.Mutex
 	finishOnce sync.Once
-	continuing atomic.Bool
+	finished   atomic.Bool
+}
+
+// A duplicate on the recovery path can wait for an origin read already in
+// progress. The producer closes ready only after releasing its sequence claim.
+type partResult struct {
+	ready chan struct{}
+	part  *PayloadPart
+}
+
+type payloadContinuation struct {
+	stream *payloadStream
+
+	seq, size int32
+	producing *partResult
+	replay    *partResult
+	once      sync.Once
+}
+
+func (c *payloadContinuation) release() {
+	c.once.Do(func() {
+		c.stream.pending.Store(nil)
+		if c.producing != nil {
+			close(c.producing.ready)
+		}
+	})
 }
 
 func (s *payloadStream) finish() {
 	s.finishOnce.Do(func() {
+		s.finished.Store(true)
 		_ = s.Data.Close()
 		if s.lease != nil {
 			s.lease.release()
 		}
 	})
-}
-
-func (s *payloadStream) tryStartContinuation() bool {
-	return s.continuing.CompareAndSwap(false, true)
-}
-
-func (s *payloadStream) finishContinuation() {
-	s.continuing.Store(false)
 }
 
 type streamChunk struct {

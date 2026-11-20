@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	zerologlog "github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-go/adnl"
 	adnladdress "github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/adnl/rldp"
 	"io"
 	"log"
@@ -34,6 +36,9 @@ type Server struct {
 	rldpInfos      map[string]*rldpInfo
 	activeRequests *activeRequestRegistry
 	adnlServer     *adnl.Gateway
+	tunneledQUIC   bool
+	quicServer     *quic.Gateway
+	quicConn       net.PacketConn
 	externalIp     net.IP
 	dispatcher     *requestDispatcher
 
@@ -41,7 +46,10 @@ type Server struct {
 	closed bool
 	mx     sync.RWMutex
 
-	Timeout time.Duration
+	Timeout            time.Duration
+	EnableQUIC         bool
+	QUICPacketConn     net.PacketConn
+	ConnectDialContext func(context.Context, string) (net.Conn, error)
 }
 
 type writerBuff struct {
@@ -59,6 +67,7 @@ type writerBuff struct {
 	timeout     uint32
 	queryId     []byte
 	requestId   []byte
+	peerID      string
 	transferId  []byte
 	lease       *requestLease
 	registered  *payloadStream
@@ -160,10 +169,12 @@ func (l *requestLease) release() {
 }
 
 type activeRequestRegistry struct {
-	shards [activeRequestShardCount]activeRequestShard
+	replies chan struct{} // bound concurrent sends from the replay cache
+	shards  [activeRequestShardCount]activeRequestShard
 }
 
 type activeRequestShard struct {
+	recent  []savedPart // oldest first
 	mx      sync.RWMutex
 	streams map[string]*payloadStream
 }
@@ -179,7 +190,7 @@ type respWriter struct {
 var Logger = log.Println
 
 func newActiveRequestRegistry() *activeRequestRegistry {
-	registry := &activeRequestRegistry{}
+	registry := &activeRequestRegistry{replies: make(chan struct{}, 32)}
 	for i := range registry.shards {
 		registry.shards[i].streams = map[string]*payloadStream{}
 	}
@@ -198,6 +209,7 @@ func (r *activeRequestRegistry) shard(key string) *activeRequestShard {
 func (r *activeRequestRegistry) store(key string, stream *payloadStream) *payloadStream {
 	shard := r.shard(key)
 	shard.mx.Lock()
+	shard.forgetPart(key)
 	previous := shard.streams[key]
 	shard.streams[key] = stream
 	shard.mx.Unlock()
@@ -215,23 +227,55 @@ func (r *activeRequestRegistry) getAndRefresh(key string, validTill time.Time) *
 	return stream
 }
 
-func (r *activeRequestRegistry) claimContinuation(
-	key string,
-	validTill time.Time,
-) (stream *payloadStream, exists bool) {
+func (r *activeRequestRegistry) refreshIfSame(key string, expected *payloadStream, validTill time.Time) bool {
 	shard := r.shard(key)
 	shard.mx.Lock()
 	defer shard.mx.Unlock()
+	if expected == nil || shard.streams[key] != expected || expected.finished.Load() {
+		return false
+	}
+	if validTill.After(expected.ValidTill) {
+		expected.ValidTill = validTill
+	}
+	return true
+}
 
-	stream = shard.streams[key]
+func (r *activeRequestRegistry) claimContinuation(key string, validTill time.Time, req GetNextPayloadPart) (*payloadContinuation, bool) {
+	sh := r.shard(key)
+	sh.mx.Lock()
+	defer sh.mx.Unlock()
+	stream := sh.streams[key]
+	var replay *partResult
+	var pending *payloadContinuation
+	if stream != nil {
+		pending = stream.pending.Load()
+	}
+	if pending != nil {
+		if pending.producing == nil || pending.seq != req.Seqno || pending.size != req.MaxChunkSize {
+			return nil, true
+		}
+		replay = pending.producing
+	} else if part := sh.findPart(key, req, time.Now()); part != nil {
+		replay = &partResult{part: part}
+	}
+	if replay != nil {
+		select {
+		case r.replies <- struct{}{}:
+			return &payloadContinuation{replay: replay}, true
+		default:
+			return nil, true
+		}
+	}
 	if stream == nil {
 		return nil, false
 	}
-	if !stream.tryStartContinuation() {
-		return nil, true
+	claim := &payloadContinuation{stream: stream, seq: req.Seqno, size: req.MaxChunkSize}
+	if stream.resumable {
+		claim.producing = &partResult{ready: make(chan struct{})}
 	}
+	stream.pending.Store(claim)
 	stream.ValidTill = validTill
-	return stream, true
+	return claim, true
 }
 
 func (r *activeRequestRegistry) get(key string) *payloadStream {
@@ -259,6 +303,7 @@ func (r *activeRequestRegistry) expired(now time.Time) []*payloadStream {
 	for i := range r.shards {
 		shard := &r.shards[i]
 		shard.mx.Lock()
+		shard.expireParts(now)
 		for key, stream := range shard.streams {
 			if stream.ValidTill.Before(now) {
 				delete(shard.streams, key)
@@ -275,6 +320,7 @@ func (r *activeRequestRegistry) drain() []*payloadStream {
 	for i := range r.shards {
 		shard := &r.shards[i]
 		shard.mx.Lock()
+		shard.recent = nil
 		for key, stream := range shard.streams {
 			delete(shard.streams, key)
 			streams = append(streams, stream)
@@ -423,11 +469,22 @@ func newServer(
 		dispatcher:     newRequestDispatcher(maxConcurrentRequests),
 		closer:         make(chan bool, 1),
 		Timeout:        30 * time.Second,
+		EnableQUIC:     true,
 		adnlServer:     gate,
 	}
 }
 
 func (s *Server) ListenAndServe(listenAddr string) error {
+	return s.listenAndServe(listenAddr, true)
+}
+
+// ListenAndServeTunnel serves RLDP on the tunnel gateway and enables QUIC
+// when UseQUICTunnel supplied the corresponding packet connection.
+func (s *Server) ListenAndServeTunnel(listenAddr string) error {
+	return s.listenAndServe(listenAddr, s.tunneledQUIC && s.QUICPacketConn != nil)
+}
+
+func (s *Server) listenAndServe(listenAddr string, enableQUIC bool) error {
 	go func() {
 		for {
 			select {
@@ -477,10 +534,10 @@ func (s *Server) ListenAndServe(listenAddr string) error {
 
 		previousHandler := client.GetQueryHandler()
 		client.SetQueryHandler(func(query *adnl.MessageQuery) error {
-			switch query.Data.(type) {
+			switch offer := query.Data.(type) {
 			case GetCapabilities:
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				err := client.Answer(ctx, query.ID, &Capabilities{Value: CapabilityRLDP2})
+				err := client.Answer(ctx, query.ID, &Capabilities{Value: s.capabilitiesFor(offer.Capabilities)})
 				cancel()
 				if err != nil {
 					return fmt.Errorf("failed to send capabilities answer: %w", err)
@@ -502,6 +559,12 @@ func (s *Server) ListenAndServe(listenAddr string) error {
 	if err != nil {
 		_ = s.Stop()
 		return err
+	}
+
+	if enableQUIC && s.EnableQUIC {
+		if err := s.startQUIC(listenAddr); err != nil {
+			zerologlog.Warn().Err(err).Msg("Failed to start QUIC, continuing with RLDP2")
+		}
 	}
 
 	<-s.closer
@@ -557,6 +620,15 @@ func (s *Server) Stop() (err error) {
 		}
 		if s.dht != nil {
 			s.dht.Close()
+		}
+
+		if s.quicServer != nil {
+			if closeErr := s.quicServer.Close(); closeErr != nil {
+				Logger("failed to close QUIC gateway:", closeErr)
+			}
+			_ = s.quicConn.Close()
+			s.quicServer = nil
+			s.quicConn = nil
 		}
 
 		if s.adnlServer != nil {
@@ -636,7 +708,7 @@ func (s *Server) handle(client RLDP, adnlId, addr string) func(transferId []byte
 		}
 
 		var lease *requestLease
-		var continuation *payloadStream
+		var continuation *payloadContinuation
 		switch req := query.Data.(type) {
 		case Request:
 			if err := dispatcher.acquire(); err != nil {
@@ -650,18 +722,18 @@ func (s *Server) handle(client RLDP, adnlId, addr string) func(transferId []byte
 			if err := dispatcher.checkRunning(); err != nil {
 				return err
 			}
-			requestKey := hex.EncodeToString(req.ID)
-			stream, exists := s.activeRequests.claimContinuation(
+			requestKey := payloadKey(adnlId, req.ID)
+			claimed, exists := s.activeRequests.claimContinuation(
 				requestKey,
-				time.Now().Add(s.Timeout),
+				time.Now().Add(s.Timeout), req,
 			)
 			if !exists {
 				return fmt.Errorf("unknown request id %s", requestKey)
 			}
-			if stream == nil {
+			if claimed == nil {
 				return errPayloadContinuationInProgress
 			}
-			continuation = stream
+			continuation = claimed
 		default:
 			return nil
 		}
@@ -677,7 +749,7 @@ func (s *Server) handle(client RLDP, adnlId, addr string) func(transferId []byte
 
 func (s *Server) runQuery(
 	lease *requestLease,
-	continuation *payloadStream,
+	continuation *payloadContinuation,
 	client RLDP,
 	adnlId string,
 	netAddr *net.UDPAddr,
@@ -687,23 +759,33 @@ func (s *Server) runQuery(
 	if lease != nil {
 		defer lease.release()
 	}
-	if continuation != nil {
-		defer continuation.finishContinuation()
-	}
+	var queryErr error
 	defer func() {
+		if continuation != nil && continuation.replay != nil {
+			<-s.activeRequests.replies
+		} else if continuation != nil {
+			continuation.release()
+		}
 		if recovered := recover(); recovered != nil {
+			queryErr = fmt.Errorf("panic while handling HTTP query: %v", recovered)
 			Logger("panic while handling RLDP HTTP query: ", recovered, "\n", string(debug.Stack()))
+		}
+		if queryErr != nil && query != nil {
+			if pending, ok := client.(interface{ failQuery([]byte, error) }); ok {
+				pending.failQuery(query.ID, queryErr)
+			}
 		}
 	}()
 
-	if err := s.handleQuery(lease, continuation, client, adnlId, netAddr, transferId, query); err != nil {
-		Logger("failed to handle RLDP HTTP query: ", err)
+	queryErr = s.handleQuery(lease, continuation, client, adnlId, netAddr, transferId, query)
+	if queryErr != nil {
+		Logger("failed to handle RLDP HTTP query: ", queryErr)
 	}
 }
 
 func (s *Server) handleQuery(
 	lease *requestLease,
-	continuation *payloadStream,
+	continuation *payloadContinuation,
 	client RLDP,
 	adnlId string,
 	netAddr *net.UDPAddr,
@@ -712,6 +794,9 @@ func (s *Server) handleQuery(
 ) error {
 	switch req := query.Data.(type) {
 	case Request:
+		if req.Method == http.MethodConnect {
+			return s.handleConnect(lease, client, transferId, query, req, adnlId)
+		}
 		uri, err := url.Parse(req.URL)
 		if err != nil {
 			Logger("bad HTTP request over RLDP: failed to parse url", req.URL, err)
@@ -773,6 +858,7 @@ func (s *Server) handleQuery(
 			timeout:     query.Timeout,
 			queryId:     query.ID,
 			requestId:   req.ID,
+			peerID:      adnlId,
 			transferId:  transferId,
 			lease:       lease,
 		}
@@ -809,9 +895,29 @@ func (s *Server) handleQuery(
 		stream.Finish()
 		completed = true
 	case GetNextPayloadPart:
-		requestKey := hex.EncodeToString(req.ID)
-		stream := continuation
-		if stream == nil {
+		if continuation != nil && continuation.replay != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+			defer cancel()
+			result := continuation.replay
+			if result.ready != nil {
+				select {
+				case <-result.ready:
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-s.closer:
+					return ErrServerStopped
+				}
+			}
+			if result.part == nil {
+				return errors.New("response part could not be read")
+			}
+			return client.SendAnswer(ctx, query.MaxAnswerSize, query.Timeout, query.ID, transferId, result.part)
+		}
+		requestKey := payloadKey(adnlId, req.ID)
+		var stream *payloadStream
+		if continuation != nil {
+			stream = continuation.stream
+		} else {
 			stream = s.activeRequests.getAndRefresh(requestKey, time.Now().Add(s.Timeout))
 		}
 
@@ -821,21 +927,40 @@ func (s *Server) handleQuery(
 
 		part, err := handleGetPart(req, stream)
 		if err != nil {
+			if stream.onResponseEOF != nil {
+				s.activeRequests.deleteIfSame(requestKey, stream)
+				stream.finish()
+			}
 			return fmt.Errorf("handle part err: %w", err)
 		}
 
+		if continuation != nil && continuation.producing != nil {
+			s.activeRequests.rememberPart(requestKey, req, stream, part, s.Timeout)
+			continuation.producing.part = part
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+		if continuation != nil {
+			// The next part can arrive as soon as SendAnswer publishes this one.
+			// The worker's deferred release must not clear that newer admission.
+			continuation.release()
+		}
 		err = client.SendAnswer(ctx, query.MaxAnswerSize, query.Timeout, query.ID, transferId, part)
 		cancel()
 		if err != nil {
-			s.activeRequests.deleteIfSame(requestKey, stream)
-			stream.finish()
+			if !stream.resumable || part.IsLast {
+				s.activeRequests.deleteIfSame(requestKey, stream)
+				stream.finish()
+			}
 			return fmt.Errorf("failed to send answer: %w", err)
 		}
 
 		if part.IsLast {
-			s.activeRequests.deleteIfSame(requestKey, stream)
-			stream.finish()
+			if stream.onResponseEOF != nil {
+				stream.onResponseEOF()
+			} else {
+				s.activeRequests.deleteIfSame(requestKey, stream)
+				stream.finish()
+			}
 		}
 	}
 	return nil
@@ -856,9 +981,10 @@ func (s *Server) fetchPayload(ctx context.Context, requestID []byte, client RLDP
 		}
 
 		last = part.IsLast
-		_, err = w.Write(part.Data)
-		if err != nil {
-			return err
+		if len(part.Data) > 0 {
+			if _, err = w.Write(part.Data); err != nil {
+				return err
+			}
 		}
 
 		seqno++
@@ -928,7 +1054,7 @@ func (w *writerBuff) flushReader() error {
 
 func (w *writerBuff) abortResponse() {
 	if w.registered != nil {
-		w.server.activeRequests.deleteIfSame(hex.EncodeToString(w.requestId), w.registered)
+		w.server.activeRequests.deleteIfSame(payloadKey(w.peerID, w.requestId), w.registered)
 		w.registered.finish()
 		return
 	}
@@ -971,9 +1097,11 @@ func (w *writerBuff) flush(payload []byte, forcePayload bool) error {
 	}
 
 	var registeredStream *payloadStream
-	requestKey := hex.EncodeToString(w.requestId)
+	requestKey := payloadKey(w.peerID, w.requestId)
 	if hasPayload {
+		_, resumable := w.client.(*quicClient)
 		candidate := &payloadStream{
+			resumable: resumable,
 			Data:      w.stream,
 			ValidTill: time.Now().Add(w.server.Timeout),
 		}
